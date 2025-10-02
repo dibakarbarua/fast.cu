@@ -27,18 +27,19 @@ void cudaCheck(cudaError_t error, const char *file, int line) {
 }
 #define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
 
-#include "examples/matmul/matmul_1.cuh"
-#include "examples/matmul/matmul_2.cuh"
-#include "examples/matmul/matmul_3.cuh"
-#include "examples/matmul/matmul_4.cuh"
-#include "examples/matmul/matmul_5.cuh"
-#include "examples/matmul/matmul_6.cuh"
-#include "examples/matmul/matmul_7.cuh"
-#include "examples/matmul/matmul_8.cuh"
-#include "examples/matmul/matmul_9.cuh"
-#include "examples/matmul/matmul_10.cuh"
-#include "examples/matmul/matmul_11.cuh"
-#include "examples/matmul/matmul_12.cuh"
+#include "db_repro/matmul_tma_wgmma.cuh"
+// #include "examples/matmul/matmul_1.cuh"
+// #include "examples/matmul/matmul_2.cuh"
+// #include "examples/matmul/matmul_3.cuh"
+// #include "examples/matmul/matmul_4.cuh"
+// #include "examples/matmul/matmul_5.cuh"
+// #include "examples/matmul/matmul_6.cuh"
+// #include "examples/matmul/matmul_7.cuh"
+// #include "examples/matmul/matmul_8.cuh"
+// #include "examples/matmul/matmul_9.cuh"
+// #include "examples/matmul/matmul_10.cuh"
+// #include "examples/matmul/matmul_11.cuh"
+// #include "examples/matmul/matmul_12.cuh"
 
 std::default_random_engine generator(69);
 cublasHandle_t cublas_handle;
@@ -60,41 +61,43 @@ void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, 
       runCublasGemmBF16(M, N, K, A, B, C);
       break;
     case 1:
-      runKernel1(M, N, K, A, B, C);
-      break;
-    case 2:
-      runKernel2(M, N, K, A, B, C);
-      break;
-    case 3:
-      runKernel3(M, N, K, A, B, C, DB);
-      break;
-    case 4:
-      runKernel4(M, N, K, A, B, C, DB);
-      break;
-    case 5:
-      runKernel5(M, N, K, A, B, C, DB);
-      break;
-    case 6:
-      runKernel6(M, N, K, A, B, C, DB);
-      break;
-    case 7:
-      runKernel7(M, N, K, A, B, C, DB);
-      break;
-    case 8:
-      runKernel8(M, N, K, A, B, C, DB);
-      break;
-    case 9:
-      runKernel9(M, N, K, A, B, C, DB);
-      break;
-    case 10:
-      runKernel10(M, N, K, A, B, C, DB);
-      break;
-    case 11:
-      runKernel11(M, N, K, A, B, C, DB);
-      break;
-    case 12:
-      runKernel12(M, N, K, A, B, C, DB);
-      break;
+      runTmaWgmmaBF16(M, N, K, A, B, C);
+    // case 1:
+    //   runKernel1(M, N, K, A, B, C);
+    //   break;
+    // case 2:
+    //   runKernel2(M, N, K, A, B, C);
+    //   break;
+    // case 3:
+    //   runKernel3(M, N, K, A, B, C, DB);
+    //   break;
+    // case 4:
+    //   runKernel4(M, N, K, A, B, C, DB);
+    //   break;
+    // case 5:
+    //   runKernel5(M, N, K, A, B, C, DB);
+    //   break;
+    // case 6:
+    //   runKernel6(M, N, K, A, B, C, DB);
+    //   break;
+    // case 7:
+    //   runKernel7(M, N, K, A, B, C, DB);
+    //   break;
+    // case 8:
+    //   runKernel8(M, N, K, A, B, C, DB);
+    //   break;
+    // case 9:
+    //   runKernel9(M, N, K, A, B, C, DB);
+    //   break;
+    // case 10:
+    //   runKernel10(M, N, K, A, B, C, DB);
+    //   break;
+    // case 11:
+    //   runKernel11(M, N, K, A, B, C, DB);
+    //   break;
+    // case 12:
+    //   runKernel12(M, N, K, A, B, C, DB);
+    //   break;
   }
 }
 int yo = 0;
@@ -169,7 +172,7 @@ int main() {
 
   int repeat_times = 8;
   bool run_verif = true;
-  for (int kernel_num : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}) {
+  for (int kernel_num : {1}) {
     // for (int kernel_num : {0, 11}) {
     // Give the GPU some rest to avoid thermal throttling
     sleep(5);
