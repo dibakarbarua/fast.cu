@@ -59,7 +59,7 @@ __device__ void wgmma64(float d_out[4][8], bf16* sA, bf16* sB) {
 
 template <int BM, int BN, int BK, int WGMMA_M, int WGMMA_N, int WGMMA_K, int NUM_THREADS>
 __global__ void kernel(int M, int N, int K, bf16 *C, CUtensorMap *tma_map_A, CUtensorMap *tma_map_B) {
-    /* 1. Setup SMEM: TMA Engine expects 128B aligned addrs */
+    /* 1. Setup SMEM: When the matrices are in shared memory, their starting addresses must be aligned to 16 bytes. (From WGMMA PTX) */
     __shared__ alignas(128) bf16 sA[BM * BK]; // ATile -> can also be in Registers
     __shared__ alignas(128) bf16 sB[BN * BK]; // BTile 
 
