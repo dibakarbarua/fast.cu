@@ -59,12 +59,20 @@ __device__ void wgmma64(float d_out[4][8], bf16* sA, bf16* sB) {
 
 template <int BM, int BN, int BK, int WGMMA_M, int WGMMA_N, int WGMMA_K, int NUM_THREADS>
 __global__ void kernel(int M, int N, int K, bf16 *C, CUtensorMap *tma_map_A, CUtensorMap *tma_map_B) {
-    /* 1. Setup SMEM: When the matrices are in shared memory, their starting addresses must be aligned to 16 bytes. (From WGMMA PTX) */
+    /* 1. Setup SMEM: TMA alignment is 128B, WGMMA alignment is 16B */
     __shared__ alignas(128) bf16 sA[BM * BK]; // ATile -> can also be in Registers
     __shared__ alignas(128) bf16 sB[BN * BK]; // BTile 
 
     /* 2. Setup Accumulator: D */
-    float d_out [WGMMA_N/16][8];
+    // Refer to PTX documentation in Sections:
+    // 9.7.15.5.1. : k=16 (16-bit A/B)
+    // 9.7.15.5.2. : k=8  (32-bit A/B)
+    // 9.7.15.5.3. : k=32  (8-bit A/B)
+    // 9.7.15.5.4. : k=256 (1-bit A/B)
+    // Note: C is 
+    // In general, threads in a warpgroup are laid out as 16x8 to hold register fragments
+    // Each register fragment has to store 32-bits worth of operands
+    float d_out [WGMMA_M/16][WGMMA_N/8];
     static_assert(sizeof(d_out) * NUM_THREADS == BM * BN * sizeof(float), "Accumulator size does not match tile size");
     memset(d_out, 0, sizeof(d_out));
 
