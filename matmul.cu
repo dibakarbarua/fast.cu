@@ -173,7 +173,6 @@ int main() {
   int repeat_times = 8;
   bool run_verif = true;
   for (int kernel_num : {1}) {
-    // for (int kernel_num : {0, 11}) {
     // Give the GPU some rest to avoid thermal throttling
     sleep(5);
     std::cout << "KERNEL " << kernel_num << std::endl;
