@@ -142,6 +142,8 @@ __global__ void __launch_bounds__(NUM_THREADS) matmulKernel2(int M, int N, int K
         uint32_t row = warp*16 + lane / 4;
         bf16 *block_C = C + num_block_n*BN*M + num_block_m*BM;
 
+        // Accumulator Register Fragment
+        // float d_out[WGMMA_N/16][8];
         for (int m_it = 0; m_it < BM/WGMMA_M; ++m_it) {
             for (int n_it = 0; n_it < BN/WGMMA_N; ++n_it) {
                 for (int w = 0; w < WGMMA_N/16; ++w) {

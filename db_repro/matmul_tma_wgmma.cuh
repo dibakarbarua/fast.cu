@@ -1,7 +1,84 @@
 namespace matmul_tma_wgmma {
 
-// Descriptor for a shared memory matrix.
+/* ------ Descriptors for a shared memory matrix ------ */
 // Implementation is derived from PTX guide: https://docs.nvidia.com/cuda/parallel-thread-execution/#matrix-descriptor-format
+/*
+
+In terms of CuTe layouts the canonical layout can be expressed as follows:
+
+1. MN- major
+a.) No-swizzling or Interleaved
+((T,1,m),(8,k)):((1,T,SBO),(1T,LBO))
+Swizzle<0, 4, 3>
+
+b.) 32B Swizzling
+((T,2,m),(8,k)):((1,T,LBO),(2T,SBO))
+Swizzle<1, 4, 3>
+
+c.) 64B Swizzling
+((T,4,m),(8,k)):((1,T,LBO),(4T,SBO))
+Swizzle<2, 4, 3>
+
+d.) 128B Swizzling
+((T,8,m),(8,k)):((1,T,LBO),(8T,SBO))
+Swizzle<3, 4, 3>
+
+2. K- major
+a.) No-swizzling or Interleaved
+((8,m),(T,2k)):((1T,SBO),(1,LBO))
+Swizzle<0, 4, 3>
+
+b.) 32B Swizzling
+((8,m),(T,2k)):((2T,SBO),(1,T))
+Swizzle<1, 4, 3>
+
+c.) 64B Swizzling
+((8,m),(T,2k)):((4T,SBO),(1,T))
+Swizzle<2, 4, 3>
+
+d.) 128B Swizzling
+((8,m),(T,2k)):((8T,SBO),(1,T))
+Swizzle<3, 4, 3>
+
+where,
+T = 128 / sizeof-elements-in-bits T represents scale factor which normalizes matrix element types to 128-bits.
+m represents the number of repeating patterns across rows.
+k represents the number of repeating patterns across columns.
+
+The leading/stride dimension byte offset is defined differently for transposed and non-transposed matrices. 
+The leading/stride byte offset is defined as follows for matrices whose element types are normalized to 128-bits:
+
+LBO: Leading dimension byte offset
+1. K-Major
+    - No-Swizzling: 
+    The offset from the first column to the second columns of the 8x2 tile in the 128-bit element type normalized matrix.
+    - Swizzled layouts: not used, assumed to be 1.
+2. MN-Major
+    - Interleave: offset from the first 8 columns to the next 8 columns.
+    - Swizzled layouts: 
+    offset from the first (swizzle-byte-size/16) rows to the next (swizzle-byte-size/16) rows.
+
+SBO: Stride dimension byte offset
+1. K-Major
+    - Swizzled/Interleaved:
+    The offset from the first 8 rows to the next 8 rows.
+2. MN-Major
+    - Interleave: offset from the first row to the next row.
+    - Swizzled layout: offset from the first 8 columns to the next 8 columns
+
+Matrix transpose
+* When using the normal shared memory layout, there are eight
+* 8-way shared memory bank conflict when storing to the transpose.
+* When enabling the 128-byte swizzle pattern and using the according access pattern,
+* they are eliminated both for load and store.
+    for(int sidx_j =threadIdx.x; sidx_j < 8; sidx_j+= blockDim.x){
+        for(int sidx_i = 0; sidx_i < 8; ++sidx_i){
+            const int swiz_j_idx = (sidx_i % 8) ^ sidx_j;
+            const int swiz_i_idx_tr = (sidx_j % 8) ^ sidx_i;
+            smem_buffer_tr[sidx_j][swiz_i_idx_tr] = smem_buffer[sidx_i][swiz_j_idx];
+        }
+    }
+*/
 __device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) { return (((x) & 0x3FFFF) >> 0x4); }
 
 __device__ uint64_t make_smem_desc(bf16* ptr) {
@@ -70,8 +147,39 @@ __global__ void kernel(int M, int N, int K, bf16 *C, CUtensorMap *tma_map_A, CUt
     // 9.7.15.5.3. : k=32  (8-bit A/B)
     // 9.7.15.5.4. : k=256 (1-bit A/B)
     // Note: C is 
-    // In general, threads in a warpgroup are laid out as 16x8 to hold register fragments
-    // Each register fragment has to store 32-bits worth of operands
+    // for each WGMMA_M x WGMMA_N tile, we have threads storing registers as
+    /*
+    PSA: NVIDIA PTX Documentation is hot-garbage.
+    < ------- One WGMMA instructions' output --->
+    < ------- K = 16 = 16x4 = 64B of C --------->
+    Warp0
+    <---- 32B ---------->   <---- 32B ---------->  ----- > iterations to WGMMA_N
+    | T0   T1   T2   T3  | | T0   T1   T2   T3  | 
+    | T4   T5   T6   T7  | | T4   T5   T6   T7  |
+    | T8   T9   T10  T11 | | T8   T9   T10  T11 |  
+    | T12  T13  T14  T15 | | T12  T13  T14  T15 | 
+    | T16  T17  T18  T19 | | T16  T17  T18  T19 |
+    | T20  T21  T22  T23 | | T20  T21  T22  T23 | 
+    | T24  T25  T26  T27 | | T24  T25  T26  T27 |
+    | T28  T29  T30  T31 | | T28  T29  T30  T31 | 
+    Warp0
+    | T0   T1   T2   T3  | | T0   T1   T2   T3  | 
+    | T4   T5   T6   T7  | | T4   T5   T6   T7  |
+    | T8   T9   T10  T11 | | T8   T9   T10  T11 |  
+    | T12  T13  T14  T15 | | T12  T13  T14  T15 | 
+    | T16  T17  T18  T19 | | T16  T17  T18  T19 |
+    | T20  T21  T22  T23 | | T20  T21  T22  T23 | 
+    | T24  T25  T26  T27 | | T24  T25  T26  T27 |
+    | T28  T29  T30  T31 | | T28  T29  T30  T31 | 
+    // InnerDim (Per WGMMA instruction) Cvalues per-thread = 4*(8B/dtype_size)
+    // OuterDim (Per WGMMA) Cvalues per-thread = (WGMMA_N * dtype_size) / 64B
+    Warp1
+    Warp1
+    Warp2
+    Warp2
+    Warp3
+    Warp3
+    */
     float d_out [WGMMA_M/16][WGMMA_N/8];
     static_assert(sizeof(d_out) * NUM_THREADS == BM * BN * sizeof(float), "Accumulator size does not match tile size");
     memset(d_out, 0, sizeof(d_out));
@@ -91,42 +199,117 @@ __global__ void kernel(int M, int N, int K, bf16 *C, CUtensorMap *tma_map_A, CUt
     /* 4. Setup Tile Iterations */
     static_assert(M % BM == 0 && N % BN == 0 && K % BK == 0, "M, N, K must be multiples of BM, BN, BK respectively");
     static constexpr uint32_t kNumWgmmaPerTile = K / BK;
-    uint32_t tile_idx_m = blockIdx.x;
-    uint32_t tile_idx_n = blockIdx.y;
+    uint32_t tile_start_m = blockIdx.x;
+    uint32_t tile_start_n = blockIdx.y;
+    uint32_t tile_step_m = grimDim.x * BM; // Entire CTA is 1 warpgroup or 1 tile
+    uint32_t tile_step_n = gridDim.y * BN;
+    uint32_t num_tiles_K = K / BK;
+    
+    // Not unrolled, outer-loop
+    for(uint32_t tile_idx_m = tile_start_m; tile_idx_m < M; tile_idx_m += tile_step_m) {
+        for(uint32_t tile_idx_n = tile_start_n; tile_idx_n < N; tile_idx_n += tile_step_n) {
+            for(uint32_t iter_K = 0; iter_K<num_tiles_K; iter_K++) {
+                /* 5. Load A and B Tiles using TMA Async Copy */
+                if (threadIdx.x == 0) {
+                    // We are operating in K-Major, minor-dim (rank0) is K
+                    cde::cp_async_bulk_tensor_2d_global_to_shared(&sA[0], tma_map_A, iter_K * BK, tile_idx_m * BM, barA);
+                    tokenA = cuda::device::barrier_arrive_tx(barA, 1, sizeof(sA)); // signal thread0 arrival on barA
+                    cde::cp_async_bulk_tensor_2d_global_to_shared(&sB[0], tma_map_B, iter_K * BK, tile_idx_n * BN, barB);
+                    tokenB = cuda::device::barrier_arrive_tx(barB, 1, sizeof(sB)); // signal thread0 arrival on barB
+                }
+                else {
+                    tokenA = barA.arrive(); // other threads arrive on barA
+                    tokenB = barB.arrive(); // other threads arrive on barB
+                }
 
-    // Not unrolled, inner-loop
-    for( uint32_t iter = 0; iter < num_iters_per_wg; ++iter ) {
-        /* 5. Load A and B Tiles using TMA Async Copy */
-        if (threadIdx.x == 0) {
-            // We are operating in K-Major, minor-dim (rank0) is K
-            cde::cp_async_bulk_tensor_2d_global_to_shared(&sA[0], tma_map_A, iter * BK, tile_idx_m * BM, barA);
-            tokenA = cuda::device::barrier_arrive_tx(barA, 1, sizeof(sA)); // signal thread0 arrival on barA
-            cde::cp_async_bulk_tensor_2d_global_to_shared(&sB[0], tma_map_B, iter * BK, tile_idx_n * BN, barB);
-            tokenB = cuda::device::barrier_arrive_tx(barB, 1, sizeof(sB)); // signal thread0 arrival on barB
-        }
-        else {
-            tokenA = barA.arrive(); // other threads arrive on barA
-            tokenB = barB.arrive(); // other threads arrive on barB
-        }
+                /* 6. Wait for data to arrive */
+                barA.wait(std::move(tokenA)); // wait for barA to complete
+                barB.wait(std::move(tokenB)); // wait for barB to complete
+                __syncthreads(); // ensure all threads have arrived before using SMEM
 
-        /* 6. Wait for data to arrive */
-        barA.wait(std::move(tokenA)); // wait for barA to complete
-        barB.wait(std::move(tokenB)); // wait for barB to complete
-        __syncthreads(); // ensure all threads have arrived before using SMEM
-
-        /* 7. Compute using WMMA */
-        warpgroup_arrive(); // signal warpgroup arrival for wgmma, only once per tile load
-        #pragma unroll
-        for(int t = 0; t < kNumWgmmaPerTile; t++) {
-            /* Important Note */
-            // We iterate along SMEM multiplicands (sA and sB) in steps of WGMMA_K
-            // because each wgmma call consumes WGMMA_K elements from both sA and sB
-            // The SMEM descriptors constructed in the PTX wrapper informs the ....
-            // ... TensorCore on how to step through the SMEM pointers
-            wgmma64<1, 1, 1, 0, 0>(d_out, &sA[t * WGMMA_K], &sB[t * WGMMA_K]);
+                /* 7. Compute using WGMMA */
+                warpgroup_arrive(); // signal warpgroup arrival for wgmma, only once per tile load
+                #pragma unroll
+                for(int t = 0; t < kNumWgmmaPerTile; t++) {
+                    /* Important Note */
+                    // We iterate along SMEM multiplicands (sA and sB) in steps of WGMMA_K
+                    // because each wgmma call consumes WGMMA_K elements from both sA and sB
+                    // The SMEM descriptors constructed in the PTX wrapper informs the ....
+                    // ... TensorCore on how to step through the SMEM pointers
+                    wgmma64<1, 1, 1, 0, 0>(d_out, &sA[t * WGMMA_K], &sB[t * WGMMA_K]);
+                }
+                warpgroup_commit_batch(); // commit the batch of 4 wgmma calls
+                warpgroup_wait<0>(); // wait for all (<0> pending) wgmma in the batch to complete
+            }
         }
-        warpgroup_commit_batch(); // commit the batch of 4 wgmma calls
-        warpgroup_wait<0>(); // wait for all (<0> pending) wgmma in the batch to complete
+    }
+
+    // Global Stores - We need to reduce across full-K before storing
+    // Accumulator Register Fragment
+    // float d_out[WGMMA_M/16][WGMMA_N/8];
+    for(uint32_t tile_idx_m = tile_start_m; tile_idx_m < M; tile_idx_m += tile_step_m) {
+        for(uint32_t tile_idx_n = tile_start_n; tile_idx_n < N; tile_idx_n += tile_step_n) {
+            int tid = threadIdx.x;
+            int laneIdx = tid % 32;
+            int warpIdx = tid / 32;
+            int threadColIdx = laneIdx % 4; // 0,1,2,3
+            int threadRowIdx = laneIdx / 4; // 0,1,2,3,4,5,6,7
+            const int num_accumulator_tiles_M = BM / WGMMA_M; // 64/64 = 1
+            const int num_accumulator_tiles_N = BN / WGMMA_N; // 64/64 = 1
+            int iter_M, iter_N;
+
+            bf16* block_C = C + tile_idx_n * M + tile_idx_m;
+            #pragma unroll
+            for (iter_M = 0; iter_M < num_accumulator_tiles_M; iter_M++) {
+                #pragma unroll
+                for (iter_N = 0; iter_N < num_accumulator_tiles_N; iter_N++) {
+                    // for each WGMMA_M x WGMMA_N tile, we have threads storing registers as
+                    /*
+                    
+                    < ------- One WGMMA instructions' output --->
+                    < ------- K = 16 = 16x4 = 64B of C --------->
+                    Warp0
+                    <---- 32B ---------->   <---- 32B ---------->  ----- > iterations to WGMMA_N
+                    | T0   T1   T2   T3  | | T0   T1   T2   T3  | 
+                    | T4   T5   T6   T7  | | T4   T5   T6   T7  |
+                    | T8   T9   T10  T11 | | T8   T9   T10  T11 |  
+                    | T12  T13  T14  T15 | | T12  T13  T14  T15 | 
+                    | T16  T17  T18  T19 | | T16  T17  T18  T19 |
+                    | T20  T21  T22  T23 | | T20  T21  T22  T23 | 
+                    | T24  T25  T26  T27 | | T24  T25  T26  T27 |
+                    | T28  T29  T30  T31 | | T28  T29  T30  T31 | 
+                    Warp0
+                    | T0   T1   T2   T3  | | T0   T1   T2   T3  | 
+                    | T4   T5   T6   T7  | | T4   T5   T6   T7  |
+                    | T8   T9   T10  T11 | | T8   T9   T10  T11 |  
+                    | T12  T13  T14  T15 | | T12  T13  T14  T15 | 
+                    | T16  T17  T18  T19 | | T16  T17  T18  T19 |
+                    | T20  T21  T22  T23 | | T20  T21  T22  T23 | 
+                    | T24  T25  T26  T27 | | T24  T25  T26  T27 |
+                    | T28  T29  T30  T31 | | T28  T29  T30  T31 | 
+                    // InnerDim (Per WGMMA instruction) Cvalues per-thread = 4*(8B/dtype_size)
+                    // OuterDim (Per WGMMA) Cvalues per-thread = (WGMMA_N * dtype_size) / 64B
+                    Warp1
+                    Warp1
+                    Warp2
+                    Warp2
+                    Warp3
+                    Warp3
+                    */
+                    thread_row_idx = iter_M * BM + warpIdx * 8 + threadRowIdx; // 0...63
+                    thread_col_idx = iter_N * BN;
+                    // We have [WGMMA_M/16][WGMMA_N/8] values per index to store
+                    #pragma unroll
+                    for (int w = 0; w < WGMMA_N / 8; w++) {
+                        int col = thread_col_idx + w * 8 // T0 -> T3 stores bf16x2 each
+                        block_C[thread_row_idx * M + col] = 
+                            d_out[iter_M][w * 4 + threadColIdx * 2];
+                        block_C[(thread_row_idx + 8) * M + col] = 
+                            d_out[iter_M][w * 4 + threadColIdx * 2 + 1];
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -148,7 +331,13 @@ void create_tensor_map(CUtensorMap *tma_map, bf16* gmem_ptr, int blocks_height, 
        even if your actual tensor is 1-D, 2-D, 3-D, etc.
     */
     
-    uint64_t gmem_prob_shape[5] = {(uint64_t)BlockMinorSize*blocks_width, (uint64_t)BlockMajorSize*blocks_height, 1, 1, 1};
+    uint64_t gmem_prob_shape[5] = {
+        (uint64_t)BlockMinorSize*blocks_width, 
+        (uint64_t)BlockMajorSize*blocks_height, 
+        1, 
+        1, 
+        1
+    };
     uint64_t gmem_prob_stride[5] = {sizeof(bf16), sizeof(bf16) * BlockMinorSize*blocks_width, 0, 0, 0};
     uint32_t smem_box_shape[5] = {uint32_t(BlockMinorSize), uint32_t(BlockMajorSize), 1, 1, 1};
     /* Hopper TMA you should always use smem_box_stride = {1,1,1,1,1} - Dense SMEM + Swizzle */
