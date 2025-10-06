@@ -135,7 +135,7 @@ __device__ void wgmma64(float d_out[4][8], bf16* sA, bf16* sB) {
 /*******************************************************************/
 
 template <int BM, int BN, int BK, int WGMMA_M, int WGMMA_N, int WGMMA_K, int NUM_THREADS>
-__global__ void kernel(int M, int N, int K, bf16 *C, CUtensorMap *tma_map_A, CUtensorMap *tma_map_B, CUtensorMap *tma_map_C) {
+__global__ void kernel(int M, int N, int K, float *C, CUtensorMap *tma_map_A, CUtensorMap *tma_map_B, CUtensorMap *tma_map_C) {
     /* 1. Setup SMEM: TMA alignment is 128B, WGMMA alignment is 16B */
     __shared__ alignas(128) bf16 sA[BM * BK]; // ATile -> can also be in Registers
     __shared__ alignas(128) bf16 sB[BN * BK]; // BTile 
@@ -188,10 +188,11 @@ __global__ void kernel(int M, int N, int K, bf16 *C, CUtensorMap *tma_map_A, CUt
     /* 3. Setup Barriers */
     __shared__ barrier barA;
     __shared__ barrier barB;
+    __shared__ barrier barC;
     barrier::arrival_token tokenA, tokenB; // phase tokens
     if (threadIdx.x == 0) {
-        init(&barA, blockDim.x); // number of threads expected to arrive = CTA Size
-        init(&barB, blockDim.x);
+        init(&barA, blockDim.x); // number of threads expected to arrive on tile TMA = CTA Size
+        init(&barB, blockDim.x); 
         // only one thread needs to fence and all threads must have arrived
         cde::fence_proxy_async_shared_cta(); // make sure SMEM writes are visible to async proxy
     }
@@ -272,15 +273,14 @@ __global__ void kernel(int M, int N, int K, bf16 *C, CUtensorMap *tma_map_A, CUt
                         }
 
                         /* 9. TMA Store-Reduce C Tile from SMEM to GMEM */
-                        warpgroup_arrive();
+                        cde::fence_proxy_async_shared_cta(); // Make SMEM Writes visible to TMA Engine
+                        __syncthreads(); // ensure all threads have arrived before using SMEM
                         if (threadIdx.x == 0) {
-                            cde::cp_async_bulk_tensor_2d_shared_to_global_reduce(&sC[0], tma_map_C, tile_idx_m * BM, tile_idx_n * BN, barA);
-                            tokenA = cuda::device::barrier_arrive_tx(barA, 1, sizeof(sC)); // signal thread0 arrival on barA
+                            cde::cp_async_bulk_tensor_2d_shared_to_global_reduce(&sC[0], tma_map_C, tile_idx_m * BM, tile_idx_n * BN, &sC[0]);
+                            cde::cp_async_bulk_commit_group(); // commit the bulk async-group
+                            cde::cp_async_bulk_wait_group_read<0>(); // wait for the group to complete
                         }
-                        else {
-                            tokenA = barA.arrive(); // other threads arrive on barA
-                        }
-                        barA.wait(std::move(tokenA)); // wait for barA to complete
+                        // Note that we do not wait for any data to arrive so no TMA Store Barrier is needed
                     }
                     __syncthreads();
                 }
@@ -351,7 +351,7 @@ __host__ static inline CUtensorMap* allocate_and_create_tensor_map(bf16* src, in
     return tma_map_d;
 }
 
-void runTmaWgmmaBF16(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
+void runTmaWgmmaBF16(int M, int N, int K, bf16 *A, bf16 *B, float *C) {
     constexpr int BM = 64;
     constexpr int BN = 64;
     constexpr int BK = 64;

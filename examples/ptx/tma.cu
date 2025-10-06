@@ -55,7 +55,6 @@ __global__ void kernel(const __grid_constant__ CUtensorMap tensor_map, int x, in
     
     // Initialize shared memory barrier with the number of threads participating in the barrier.
     #pragma nv_diag_suppress static_var_with_dynamic_init
-    
     __shared__ barrier bar;
     if (threadIdx.x == 0) {
         // Initialize barrier. All `blockDim.x` threads in block participate.
@@ -83,6 +82,7 @@ __global__ void kernel(const __grid_constant__ CUtensorMap tensor_map, int x, in
     
     // Symbolically modify a value in shared memory.
     smem_buffer[0][threadIdx.x] += threadIdx.x;
+    
     // Wait for shared memory writes to be visible to TMA engine.
     cde::fence_proxy_async_shared_cta();
     __syncthreads();
