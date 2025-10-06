@@ -135,10 +135,11 @@ __device__ void wgmma64(float d_out[4][8], bf16* sA, bf16* sB) {
 /*******************************************************************/
 
 template <int BM, int BN, int BK, int WGMMA_M, int WGMMA_N, int WGMMA_K, int NUM_THREADS>
-__global__ void kernel(int M, int N, int K, bf16 *C, CUtensorMap *tma_map_A, CUtensorMap *tma_map_B) {
+__global__ void kernel(int M, int N, int K, bf16 *C, CUtensorMap *tma_map_A, CUtensorMap *tma_map_B, CUtensorMap *tma_map_C) {
     /* 1. Setup SMEM: TMA alignment is 128B, WGMMA alignment is 16B */
     __shared__ alignas(128) bf16 sA[BM * BK]; // ATile -> can also be in Registers
     __shared__ alignas(128) bf16 sB[BN * BK]; // BTile 
+    __shared__ alignas(128) float sC[BM * BN]; // CTile -> store to SMEM for TMA Store Reduce
 
     /* 2. Setup Accumulator: D */
     // Refer to PTX documentation in Sections:
@@ -180,7 +181,7 @@ __global__ void kernel(int M, int N, int K, bf16 *C, CUtensorMap *tma_map_A, CUt
     Warp3
     Warp3
     */
-    float d_out [WGMMA_M/16][WGMMA_N/8];
+    float d_out [WGMMA_N/16][4*8/sizeof(float)];
     static_assert(sizeof(d_out) * NUM_THREADS == BM * BN * sizeof(float), "Accumulator size does not match tile size");
     memset(d_out, 0, sizeof(d_out));
 
@@ -198,115 +199,90 @@ __global__ void kernel(int M, int N, int K, bf16 *C, CUtensorMap *tma_map_A, CUt
 
     /* 4. Setup Tile Iterations */
     static_assert(M % BM == 0 && N % BN == 0 && K % BK == 0, "M, N, K must be multiples of BM, BN, BK respectively");
-    static constexpr uint32_t kNumWgmmaPerTile = K / BK;
+    static_assert(BM % WGMMA_M == 0 && BN % WGMMA_N == 0 && BK % WGMMA_K == 0, "BM, BN, BK must be multiples of WGMMA_M, WGMMA_N, WGMMA_K respectively");
+    static constexpr uint32_t kNumWgmmaPerTile = BK / WGMMA_K; // 64/16 = 4
+    static constexpr uint32_t kNumWgmmaMTiles = BM / WGMMA_M; // 64/64 = 1
+    static constexpr uint32_t kNumWgmmaNTiles = BN / WGMMA_N; // 64/64 = 1
     uint32_t tile_start_m = blockIdx.x;
     uint32_t tile_start_n = blockIdx.y;
     uint32_t tile_step_m = grimDim.x * BM; // Entire CTA is 1 warpgroup or 1 tile
     uint32_t tile_step_n = gridDim.y * BN;
-    uint32_t num_tiles_K = K / BK;
+    uint32_t num_iters_K = K / BK;
     
-    // Not unrolled, outer-loop
+    // Not unrolled, outer-loops
     for(uint32_t tile_idx_m = tile_start_m; tile_idx_m < M; tile_idx_m += tile_step_m) {
         for(uint32_t tile_idx_n = tile_start_n; tile_idx_n < N; tile_idx_n += tile_step_n) {
-            for(uint32_t iter_K = 0; iter_K<num_tiles_K; iter_K++) {
-                /* 5. Load A and B Tiles using TMA Async Copy */
-                if (threadIdx.x == 0) {
-                    // We are operating in K-Major, minor-dim (rank0) is K
-                    cde::cp_async_bulk_tensor_2d_global_to_shared(&sA[0], tma_map_A, iter_K * BK, tile_idx_m * BM, barA);
-                    tokenA = cuda::device::barrier_arrive_tx(barA, 1, sizeof(sA)); // signal thread0 arrival on barA
-                    cde::cp_async_bulk_tensor_2d_global_to_shared(&sB[0], tma_map_B, iter_K * BK, tile_idx_n * BN, barB);
-                    tokenB = cuda::device::barrier_arrive_tx(barB, 1, sizeof(sB)); // signal thread0 arrival on barB
-                }
-                else {
-                    tokenA = barA.arrive(); // other threads arrive on barA
-                    tokenB = barB.arrive(); // other threads arrive on barB
-                }
-
-                /* 6. Wait for data to arrive */
-                barA.wait(std::move(tokenA)); // wait for barA to complete
-                barB.wait(std::move(tokenB)); // wait for barB to complete
-                __syncthreads(); // ensure all threads have arrived before using SMEM
-
-                /* 7. Compute using WGMMA */
-                warpgroup_arrive(); // signal warpgroup arrival for wgmma, only once per tile load
+            for(uint32_t iter_idx_k = 0; iter_idx_k<num_iters_K; iter_idx_k++) {
+                // Unrolled inner-loops
                 #pragma unroll
-                for(int t = 0; t < kNumWgmmaPerTile; t++) {
-                    /* Important Note */
-                    // We iterate along SMEM multiplicands (sA and sB) in steps of WGMMA_K
-                    // because each wgmma call consumes WGMMA_K elements from both sA and sB
-                    // The SMEM descriptors constructed in the PTX wrapper informs the ....
-                    // ... TensorCore on how to step through the SMEM pointers
-                    wgmma64<1, 1, 1, 0, 0>(d_out, &sA[t * WGMMA_K], &sB[t * WGMMA_K]);
-                }
-                warpgroup_commit_batch(); // commit the batch of 4 wgmma calls
-                warpgroup_wait<0>(); // wait for all (<0> pending) wgmma in the batch to complete
-            }
-        }
-    }
-
-    // Global Stores - We need to reduce across full-K before storing
-    // Accumulator Register Fragment
-    // float d_out[WGMMA_M/16][WGMMA_N/8];
-    for(uint32_t tile_idx_m = tile_start_m; tile_idx_m < M; tile_idx_m += tile_step_m) {
-        for(uint32_t tile_idx_n = tile_start_n; tile_idx_n < N; tile_idx_n += tile_step_n) {
-            int tid = threadIdx.x;
-            int laneIdx = tid % 32;
-            int warpIdx = tid / 32;
-            int threadColIdx = laneIdx % 4; // 0,1,2,3
-            int threadRowIdx = laneIdx / 4; // 0,1,2,3,4,5,6,7
-            const int num_accumulator_tiles_M = BM / WGMMA_M; // 64/64 = 1
-            const int num_accumulator_tiles_N = BN / WGMMA_N; // 64/64 = 1
-            int iter_M, iter_N;
-
-            bf16* block_C = C + tile_idx_n * M + tile_idx_m;
-            #pragma unroll
-            for (iter_M = 0; iter_M < num_accumulator_tiles_M; iter_M++) {
-                #pragma unroll
-                for (iter_N = 0; iter_N < num_accumulator_tiles_N; iter_N++) {
-                    // for each WGMMA_M x WGMMA_N tile, we have threads storing registers as
-                    /*
-                    
-                    < ------- One WGMMA instructions' output --->
-                    < ------- K = 16 = 16x4 = 64B of C --------->
-                    Warp0
-                    <---- 32B ---------->   <---- 32B ---------->  ----- > iterations to WGMMA_N
-                    | T0   T1   T2   T3  | | T0   T1   T2   T3  | 
-                    | T4   T5   T6   T7  | | T4   T5   T6   T7  |
-                    | T8   T9   T10  T11 | | T8   T9   T10  T11 |  
-                    | T12  T13  T14  T15 | | T12  T13  T14  T15 | 
-                    | T16  T17  T18  T19 | | T16  T17  T18  T19 |
-                    | T20  T21  T22  T23 | | T20  T21  T22  T23 | 
-                    | T24  T25  T26  T27 | | T24  T25  T26  T27 |
-                    | T28  T29  T30  T31 | | T28  T29  T30  T31 | 
-                    Warp0
-                    | T0   T1   T2   T3  | | T0   T1   T2   T3  | 
-                    | T4   T5   T6   T7  | | T4   T5   T6   T7  |
-                    | T8   T9   T10  T11 | | T8   T9   T10  T11 |  
-                    | T12  T13  T14  T15 | | T12  T13  T14  T15 | 
-                    | T16  T17  T18  T19 | | T16  T17  T18  T19 |
-                    | T20  T21  T22  T23 | | T20  T21  T22  T23 | 
-                    | T24  T25  T26  T27 | | T24  T25  T26  T27 |
-                    | T28  T29  T30  T31 | | T28  T29  T30  T31 | 
-                    // InnerDim (Per WGMMA instruction) Cvalues per-thread = 4*(8B/dtype_size)
-                    // OuterDim (Per WGMMA) Cvalues per-thread = (WGMMA_N * dtype_size) / 64B
-                    Warp1
-                    Warp1
-                    Warp2
-                    Warp2
-                    Warp3
-                    Warp3
-                    */
-                    thread_row_idx = iter_M * BM + warpIdx * 8 + threadRowIdx; // 0...63
-                    thread_col_idx = iter_N * BN;
-                    // We have [WGMMA_M/16][WGMMA_N/8] values per index to store
+                for (uint32_t subtile_idx_m = 0; subtile_idx_m < kNumWgmmaMTiles; subtile_idx_m++) {
                     #pragma unroll
-                    for (int w = 0; w < WGMMA_N / 8; w++) {
-                        int col = thread_col_idx + w * 8 // T0 -> T3 stores bf16x2 each
-                        block_C[thread_row_idx * M + col] = 
-                            d_out[iter_M][w * 4 + threadColIdx * 2];
-                        block_C[(thread_row_idx + 8) * M + col] = 
-                            d_out[iter_M][w * 4 + threadColIdx * 2 + 1];
+                    for (uint32_t subtile_idx_n = 0; subtile_idx_n < kNumWgmmaNTiles; subtile_idx_n++) {
+                        /***** Work on individiual WGMMA_M x WGMMA_N accumulator subtile *****/
+                        /* 5. Load A and B Tiles using TMA Async Copy */
+                        if (threadIdx.x == 0) {
+                            // We are operating in K-Major, minor-dim (rank0) is K
+                            cde::cp_async_bulk_tensor_2d_global_to_shared(&sA[0], tma_map_A, iter_idx_k * BK, tile_idx_m * BM, barA);
+                            tokenA = cuda::device::barrier_arrive_tx(barA, 1, sizeof(sA)); // signal thread0 arrival on barA
+                            cde::cp_async_bulk_tensor_2d_global_to_shared(&sB[0], tma_map_B, iter_idx_k * BK, tile_idx_n * BN, barB);
+                            tokenB = cuda::device::barrier_arrive_tx(barB, 1, sizeof(sB)); // signal thread0 arrival on barB
+                            cde::fence_proxy_async_shared_cta(); // ensure TMA writes are visible to all threads in CTA
+                        }
+                        else {
+                            tokenA = barA.arrive(); // other threads arrive on barA
+                            tokenB = barB.arrive(); // other threads arrive on barB
+                        }
+
+                        /* 6. Wait for data to arrive */
+                        barA.wait(std::move(tokenA)); // wait for barA to complete
+                        barB.wait(std::move(tokenB)); // wait for barB to complete
+                        __syncthreads(); // ensure all threads have arrived before using SMEM
+
+                        /* 7. Compute using WGMMA */
+                        warpgroup_arrive(); // signal warpgroup arrival for wgmma, only once per tile load
+                        #pragma unroll
+                        for(int t = 0; t < kNumWgmmaPerTile; t++) {
+                            /* Important Note */
+                            // We iterate along SMEM multiplicands (sA and sB) in steps of WGMMA_K
+                            // because each wgmma call consumes WGMMA_K elements from both sA and sB
+                            // The SMEM descriptors constructed in the PTX wrapper informs the ....
+                            // ... TensorCore on how to step through the SMEM pointers
+                            wgmma64<1, 1, 1, 0, 0>(d_out, &sA[t * WGMMA_K], &sB[t * WGMMA_K]);
+                        }
+                        warpgroup_commit_batch(); // commit the batch of 4 wgmma calls
+                        warpgroup_wait<0>(); // wait for all (<0> pending) wgmma in the batch to complete
+
+                        /* 8. Store C Tile to SMEM: Unswizzled, do not have formula for (r,c) mapping */
+                        // We have a WGMMA_M x WGMMA_N tile to store
+                        float* block_sC = sC + subtile_idx_m * WGMMA_M * BN + subtile_idx_n * WGMMA_N; // CTile in SMEM
+                        int tid = threadIdx.x;
+                        int laneIdx = tid % 32;
+                        int warpIdx = tid / 32;
+                        int rowStart = laneIdx / 4 + warpIdx * 8;
+                        int colStart = (laneIdx % 4) * 2;
+                        for (int w = 0; w < WGMMA_N/16; w++) {
+                            sC[rowStart * WGMMA_N + colStart] = d_out[w/16][0];
+                            sC[rowStart * WGMMA_N + colStart + 1] = d_out[w/16][1];
+                            sC[(rowStart + 8) * WGMMA_N + colStart] = d_out[w/16][2];
+                            sC[(rowStart + 8) * WGMMA_N + colStart + 1] = d_out[w/16][3];
+                            sC[rowStart * WGMMA_N + colStart + 8] = d_out[w/16][4];
+                            sC[rowStart * WGMMA_N + colStart + 9] = d_out[w/16][5];
+                            sC[(rowStart + 8) * WGMMA_N + colStart + 8] = d_out[w/16][6];
+                            sC[(rowStart + 8) * WGMMA_N + colStart + 9] = d_out[w/16][7];
+                        }
+
+                        /* 9. TMA Store-Reduce C Tile from SMEM to GMEM */
+                        warpgroup_arrive();
+                        if (threadIdx.x == 0) {
+                            cde::cp_async_bulk_tensor_2d_shared_to_global_reduce(&sC[0], tma_map_C, tile_idx_m * BM, tile_idx_n * BN, barA);
+                            tokenA = cuda::device::barrier_arrive_tx(barA, 1, sizeof(sC)); // signal thread0 arrival on barA
+                        }
+                        else {
+                            tokenA = barA.arrive(); // other threads arrive on barA
+                        }
+                        barA.wait(std::move(tokenA)); // wait for barA to complete
                     }
+                    __syncthreads();
                 }
             }
         }
@@ -322,7 +298,7 @@ Rule of thumb for these TMA tensor maps on Hopper
    [ swap or re-compute if your data is column-major or non-contiguous. ]
 */
 
-template <int BlockMajorSize, int BlockMinorSize>
+template <int BlockMajorSize, int BlockMinorSize, bool Swizzle=true>
 void create_tensor_map(CUtensorMap *tma_map, bf16* gmem_ptr, int blocks_height, int blocks_width) {
     void* gmem_address = (void*)gmem_ptr;
     
@@ -343,6 +319,11 @@ void create_tensor_map(CUtensorMap *tma_map, bf16* gmem_ptr, int blocks_height, 
     /* Hopper TMA you should always use smem_box_stride = {1,1,1,1,1} - Dense SMEM + Swizzle */
     uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
 
+    auto swizzle_mode = CU_TENSOR_MAP_SWIZZLE_NONE;
+    if constexpr (Swizzle) {
+        swizzle_mode = CU_TENSOR_MAP_SWIZZLE_128B;
+    }
+
     CUresult result = cuTensorMapEncodeTiled(
         tma_map, 
         CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 
@@ -353,7 +334,7 @@ void create_tensor_map(CUtensorMap *tma_map, bf16* gmem_ptr, int blocks_height, 
         smem_box_shape, 
         smem_box_stride, 
         CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_128B, 
+        swizzle_mode, 
         CU_TENSOR_MAP_L2_PROMOTION_NONE, 
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
@@ -388,6 +369,7 @@ void runTmaWgmmaBF16(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     if (!d_tma_map_A) {
         d_tma_map_A = allocate_and_create_tensor_map<BM, BK>(A, M / BM, K / BK);
         d_tma_map_B = allocate_and_create_tensor_map<BN, BK>(B, N / BN, K / BK);
+        d_tma_map_C = allocate_and_create_tensor_map<BM, BN, false>(C, M / BM, N / BN);
         _prev_m = M;
         _prev_n = N;
         _prev_k = K;
@@ -403,7 +385,7 @@ void runTmaWgmmaBF16(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     /*WGMMA_K*/ 16,
     /*NUM_THREADS*/ NUM_THREADS>
     dim3 grid_dims(M/BM, N/BN), dim3 block_dims(NUM_THREADS);
-    kernel<<<grid_dims, block_dims>>>(M, N, K, C, d_tma_map_A, d_tma_map_B);
+    kernel<<<grid_dims, block_dims>>>(M, N, K, C, d_tma_map_A, d_tma_map_B, d_tma_map_C);
 }
 
 } // namespace matmul_tma_wgmma
