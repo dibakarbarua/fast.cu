@@ -1,3 +1,5 @@
+###### Dibakar's Bash Setup ######
+
 git config --global core.editor "vim"
 git config --global user.email "dibakar.barua92@gmail.com"
 git config --global user.name "Dibakar Barua"
