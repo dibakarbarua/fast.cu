@@ -281,8 +281,8 @@ __global__ void kernel(int M, int N, int K, float *C, CUtensorMap *tma_map_A, CU
                             cde::cp_async_bulk_wait_group_read<0>(); // wait for the group to complete
                         }
                         // Note that we do not wait for any data to arrive so no TMA Store Barrier is needed
-                    }
                     __syncthreads();
+                    }
                 }
             }
         }
