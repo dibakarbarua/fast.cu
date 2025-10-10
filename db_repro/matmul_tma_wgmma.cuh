@@ -227,7 +227,6 @@ __global__ void kernel(int M, int N, int K, float *C, CUtensorMap *tma_map_A, CU
                             tokenA = cuda::device::barrier_arrive_tx(barA, 1, sizeof(sA)); // signal thread0 arrival on barA
                             cde::cp_async_bulk_tensor_2d_global_to_shared(&sB[0], tma_map_B, iter_idx_k * BK, tile_idx_n * BN, barB);
                             tokenB = cuda::device::barrier_arrive_tx(barB, 1, sizeof(sB)); // signal thread0 arrival on barB
-                            cde::fence_proxy_async_shared_cta(); // ensure TMA writes are visible to all threads in CTA
                         }
                         else {
                             tokenA = barA.arrive(); // other threads arrive on barA
